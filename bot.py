@@ -5,9 +5,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import urllib.error
 import urllib.request
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -54,6 +56,7 @@ class Config:
     output_device: str
     system_prompt: str
     max_turns: int
+    playback_volume: int
 
 
 def env(name: str, default: str) -> str:
@@ -77,9 +80,10 @@ def build_config() -> Config:
         output_device=env("OUTPUT_DEVICE", ""),
         system_prompt=env(
             "SYSTEM_PROMPT",
-            "You are AIYVoice, a concise, helpful home voice assistant.",
+            "你係 AIYVoice，請一律以廣東話（繁體中文）回應，語氣自然、簡潔，像在跟屋企人對話咁回覆。",
         ),
         max_turns=int(env("MAX_TURNS", "6")),
+        playback_volume=int(env("PLAYBACK_VOLUME", "80")),
     )
 
 
@@ -94,9 +98,50 @@ def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     return proc
 
 
-def has_capture_device() -> bool:
+def list_capture_devices() -> List[str]:
     proc = run_cmd(["arecord", "-l"], check=False)
-    return "card" in proc.stdout.lower()
+    if proc.returncode != 0:
+        return []
+
+    lines = proc.stdout.splitlines()
+    in_capture_section = False
+    devices: List[str] = []
+    current_card = None
+
+    for line in lines:
+        if line.startswith("**** List of CAPTURE Hardware Devices"):
+            in_capture_section = True
+            continue
+        if line.startswith("**** List of PLAYBACK Hardware Devices"):
+            break
+        if not in_capture_section:
+            continue
+
+        combined = re.match(r"^card\s+(\d+):.*?device\s+(\d+):", line)
+        if combined:
+            candidate = f"plughw:{combined.group(1)},{combined.group(2)}"
+            if candidate not in devices:
+                devices.append(candidate)
+            current_card = None
+            continue
+
+        card_match = re.match(r"^card\s+(\d+):", line)
+        if card_match:
+            current_card = card_match.group(1)
+            continue
+
+        device_match = re.match(r"^\s*device\s+(\d+):", line)
+        if device_match and current_card is not None:
+            candidate = f"plughw:{current_card},{device_match.group(1)}"
+            if candidate not in devices:
+                devices.append(candidate)
+            current_card = None
+
+    return devices
+
+
+def has_capture_device() -> bool:
+    return len(list_capture_devices()) > 0
 
 
 def has_playback_device() -> bool:
@@ -118,16 +163,65 @@ def set_led(board, state, leds=None) -> None:
     if state is None:
         return
 
-    # Match AIYVision behavior: white button LED on/off only in AIY mode.
-    if leds is not None and Leds is not None and Color is not None:
+    def _set_rgb(rgb):
+        if leds is None or Leds is None or Color is None:
+            return False
         try:
-            if state == _led_state("OFF"):
+            if rgb is None:
                 leds.update(Leds.rgb_off())
             else:
-                leds.update(Leds.rgb_on(Color.WHITE))
-            return
+                leds.update(Leds.rgb_on(rgb))
+            return True
         except Exception:
-            pass
+            return False
+
+    # Use button RGB colors for processing states while preserving legacy board LED states.
+    if leds is not None and Leds is not None and Color is not None:
+        if state == _led_state("OFF"):
+            if _set_rgb(None):
+                return
+        if state == _led_state("DECAY"):
+            if _set_rgb((8, 8, 8)):
+                return
+        if state in (_led_state("PULSE_SLOW"), _led_state("ON")):
+            if _set_rgb(Color.BLUE):
+                return
+        if state in (_led_state("BLINK_3"), _led_state("BLINK")):
+            if _set_rgb(Color.RED):
+                return
+        if state == _led_state("PULSE_QUICK"):
+            if _set_rgb(Color.PURPLE):
+                return
+        if state == _led_state("BEACON_DARK"):
+            if _set_rgb(Color.GREEN):
+                return
+
+        if isinstance(state, str):
+            led_label = state.upper()
+            if led_label == "LISTENING":
+                if _set_rgb(Color.YELLOW):
+                    return
+            if led_label == "TRANSCRIBING":
+                if _set_rgb(Color.PURPLE):
+                    return
+            if led_label == "THINKING":
+                if _set_rgb(Color.CYAN):
+                    return
+            if led_label == "SPEAKING":
+                if _set_rgb(Color.GREEN):
+                    return
+            if led_label == "DIM":
+                if _set_rgb((12, 12, 12)):
+                    return
+            if led_label == "ERROR":
+                if _set_rgb((255, 0, 0)):
+                    return
+            if led_label == "READY":
+                if _set_rgb(Color.BLUE):
+                    return
+
+        if _set_rgb(Color.WHITE):
+            return
 
     if board is None:
         return
@@ -135,7 +229,6 @@ def set_led(board, state, leds=None) -> None:
         board.led.state = state
     except Exception:
         pass
-
 
 def add_history(history: List[Dict[str, str]], user_text: str, reply: str, max_turns: int) -> None:
     history.extend(
@@ -149,23 +242,65 @@ def add_history(history: List[Dict[str, str]], user_text: str, reply: str, max_t
         del history[:-max_items]
 
 
+def _iter_record_rates(preferred: int) -> List[int]:
+    rates = [preferred]
+    for rate in (48000, 44100, 32000, 24000, 22050, 16000):
+        if rate not in rates:
+            rates.append(rate)
+    return rates
+
+
 def record_wav(path: Path, cfg: Config) -> None:
-    cmd = [
-        "arecord",
-        "-q",
-        "-f",
-        str(cfg.record_format),
-        "-c",
-        str(cfg.record_channels),
-        "-r",
-        str(cfg.sample_rate),
-        "-d",
-        str(cfg.record_seconds),
-    ]
+    devices: List[str] = []
     if cfg.input_device:
-        cmd.extend(["-D", cfg.input_device])
-    cmd.append(str(path))
-    run_cmd(cmd)
+        devices.append(cfg.input_device)
+    else:
+        devices.extend(list_capture_devices())
+
+    if not devices:
+        devices.extend(["plughw:1,0", "plughw:0,0", "default", "hw:1,0", "hw:0,0"])
+
+    seen = set()
+    unique_devices = []
+    for device in devices:
+        if device and device not in seen:
+            seen.add(device)
+            unique_devices.append(device)
+
+    last_error = "No capture attempt made."
+
+    for device in unique_devices:
+        for rate in _iter_record_rates(cfg.sample_rate):
+            cmd = [
+                "arecord",
+                "-q",
+                "-f",
+                str(cfg.record_format),
+                "-c",
+                str(cfg.record_channels),
+                "-r",
+                str(rate),
+                "-d",
+                str(cfg.record_seconds),
+                "-D",
+                device,
+                str(path),
+            ]
+            proc = run_cmd(cmd, check=False)
+            if proc.returncode == 0 and path.exists() and path.stat().st_size > 100:
+                return
+
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+            stderr = (proc.stderr or proc.stdout or "").strip().replace("\n", " | ")
+            last_error = f"device={device}, rate={rate}, error={stderr or 'failed'}"
+
+    raise RuntimeError(f"Unable to record audio. Last attempt: {last_error}")
+
 
 
 def play_wav(path: Path, cfg: Config) -> None:
@@ -181,13 +316,55 @@ def play_wav(path: Path, cfg: Config) -> None:
             _AUDIO_WARNING_SHOWN = True
         return
 
+    play_path = path
+    scaled_tmp_path = None
+
+    volume = getattr(cfg, "playback_volume", 100)
+    try:
+        volume = int(volume)
+    except Exception:
+        volume = 100
+
+    if volume < 100:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                scaled_tmp_path = Path(tmp.name)
+            volume_factor = max(0.0, min(2.0, volume / 100.0))
+            ff_proc = run_cmd(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-filter:a",
+                    f"volume={volume_factor}",
+                    str(scaled_tmp_path),
+                ],
+                check=False,
+            )
+            if ff_proc.returncode == 0:
+                play_path = scaled_tmp_path
+            else:
+                if scaled_tmp_path is not None:
+                    scaled_tmp_path.unlink(missing_ok=True)
+                    scaled_tmp_path = None
+        except Exception as e:
+            if not _AUDIO_WARNING_SHOWN:
+                print(f"Warning: could not scale playback volume ({e}); using default volume.")
+                _AUDIO_WARNING_SHOWN = True
+            play_path = path
+
     cmd = ["aplay", "-q"]
     if cfg.output_device:
         cmd.extend(["-D", cfg.output_device])
-    cmd.append(str(path))
+    cmd.append(str(play_path))
 
     proc = run_cmd(cmd, check=False)
     if proc.returncode == 0:
+        if play_path != path:
+            play_path.unlink(missing_ok=True)
         return
 
     err = (proc.stderr or proc.stdout or "").strip()
@@ -195,7 +372,8 @@ def play_wav(path: Path, cfg: Config) -> None:
     # Some Pi setups report a playback card but cannot open it (e.g. inactive HDMI).
     # Switch to silent null sink for this run so chat flow keeps working.
     if not cfg.output_device:
-        null_proc = run_cmd(["aplay", "-D", "null", "-q", str(path)], check=False)
+        null_target = play_path
+        null_proc = run_cmd(["aplay", "-D", "null", "-q", str(null_target)], check=False)
         if null_proc.returncode == 0:
             _AUDIO_PLAYBACK_DISABLED = True
             if not _AUDIO_WARNING_SHOWN:
@@ -204,12 +382,17 @@ def play_wav(path: Path, cfg: Config) -> None:
                     "Set OUTPUT_DEVICE once speaker output is available."
                 )
                 _AUDIO_WARNING_SHOWN = True
+            if scaled_tmp_path is not None:
+                scaled_tmp_path.unlink(missing_ok=True)
             return
 
     _AUDIO_PLAYBACK_DISABLED = True
     if not _AUDIO_WARNING_SHOWN:
         print(f"Warning: audio playback disabled for this session ({err})")
         _AUDIO_WARNING_SHOWN = True
+
+    if scaled_tmp_path is not None:
+        scaled_tmp_path.unlink(missing_ok=True)
 
 
 def wav_signal_levels(path: Path):
@@ -303,63 +486,75 @@ def chat_reply(user_text: str, history: List[Dict[str, str]], cfg: Config) -> st
     return text.strip()
 
 
-def synthesize_speech(text: str, out_path: Path, cfg: Config) -> None:
+def synthesize_speech(text: str, path: Path, cfg: Config) -> None:
+    if not text.strip():
+        raise ValueError("No text provided for speech synthesis.")
+
     payload = {
         "model": cfg.tts_model,
-        "voice": cfg.tts_voice,
         "input": text,
+        "voice": cfg.tts_voice,
         "response_format": "wav",
     }
     req = urllib.request.Request(
-        f"{cfg.base_url}/audio/speech",
+        cfg.base_url + "/audio/speech",
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
         headers={
-            "Authorization": f"Bearer {cfg.api_key}",
+            "Authorization": "Bearer " + cfg.api_key,
             "Content-Type": "application/json",
+            "Accept": "audio/wav",
         },
     )
+
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             audio = resp.read()
     except urllib.error.HTTPError as e:
         details = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"TTS HTTP {e.code}: {details}") from e
-    out_path.write_bytes(audio)
+        raise RuntimeError("TTS request failed (" + str(e.code) + "): " + details) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError("Network error calling " + cfg.base_url + "/audio/speech: " + str(e)) from e
 
+    if not audio:
+        raise RuntimeError("TTS response was empty.")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(audio)
 
 def run_voice_turn(cfg: Config, history: List[Dict[str, str]], board=None, leds=None) -> None:
     with tempfile.TemporaryDirectory(prefix="aiyvoice_") as tmp:
         in_wav = Path(tmp) / "input.wav"
         out_wav = Path(tmp) / "reply.wav"
 
-        set_led(board, _led_state("BLINK_3"), leds=leds)
+        set_led(board, "LISTENING", leds=leds)
         print(f"Recording for {cfg.record_seconds}s...")
         record_wav(in_wav, cfg)
 
         rms, peak = wav_signal_levels(in_wav)
         if peak == 0:
             raise RuntimeError(
-                "No microphone signal detected (recording is all zeros). "
+                "No microphone signal detected (recording is all zeros). " +
                 "Check VoiceBonnet mic path or INPUT_DEVICE/RECORD_* settings."
             )
 
-        set_led(board, _led_state("PULSE_QUICK"), leds=leds)
+        set_led(board, "TRANSCRIBING", leds=leds)
         print("Transcribing...")
         user_text = transcribe_audio(in_wav, cfg)
         if not user_text:
             print("I did not catch that. Please try again.")
-            set_led(board, _led_state("ON"), leds=leds)
+            set_led(board, "READY", leds=leds)
             return
         print(f"You: {user_text}")
 
+        set_led(board, "THINKING", leds=leds)
         reply = chat_reply(user_text, history, cfg)
         print(textwrap.fill(f"AIYVoice: {reply}", width=92))
 
-        set_led(board, _led_state("BEACON_DARK"), leds=leds)
+        set_led(board, "SPEAKING", leds=leds)
         synthesize_speech(reply, out_wav, cfg)
         play_wav(out_wav, cfg)
-        set_led(board, _led_state("ON"), leds=leds)
+        set_led(board, "READY", leds=leds)
 
         add_history(history, user_text, reply, cfg.max_turns)
 
@@ -387,32 +582,6 @@ def print_self_test(cfg: Config) -> int:
     return 0
 
 
-def run_voice_loop(cfg: Config, once: bool) -> int:
-    history: List[Dict[str, str]] = []
-    print("Voice mode ready. Press Enter to record, or type q to quit.")
-
-    while True:
-        try:
-            action = input("\\n[Enter/q] > ").strip().lower()
-        except EOFError:
-            print("\\nInput closed. Exiting.")
-            return 0
-
-        if action in {"q", "quit", "exit"}:
-            return 0
-
-        try:
-            run_voice_turn(cfg, history)
-        except KeyboardInterrupt:
-            print("\\nStopped.")
-            return 0
-        except Exception as e:
-            print(f"Error: {e}")
-
-        if once:
-            return 0
-
-
 def run_aiy_loop(cfg: Config, once: bool) -> int:
     if not has_aiy_library():
         print("AIY library not installed. Falling back to voice mode.")
@@ -427,6 +596,10 @@ def run_aiy_loop(cfg: Config, once: bool) -> int:
         return 1
 
     history: List[Dict[str, str]] = []
+    idle_timeout = 60
+    last_activity = time.monotonic()
+    led_dimmed = False
+
     try:
         with Board() as board:
             rgb_leds = None
@@ -435,32 +608,69 @@ def run_aiy_loop(cfg: Config, once: bool) -> int:
                     rgb_leds = Leds()
                 except Exception:
                     rgb_leds = None
-            set_led(board, _led_state("OFF"), leds=rgb_leds)
+
+            set_led(board, "READY", leds=rgb_leds)
             print("AIY mode ready. Press the board button to talk. Ctrl+C to quit.")
 
             while True:
-                set_led(board, _led_state("PULSE_SLOW"), leds=rgb_leds)
-                board.button.wait_for_press()
+                now = time.monotonic()
+                if now - last_activity >= idle_timeout:
+                    if not led_dimmed:
+                        set_led(board, "DIM", leds=rgb_leds)
+                        led_dimmed = True
+                elif led_dimmed:
+                    set_led(board, "READY", leds=rgb_leds)
+                    led_dimmed = False
+
+                wait_timeout = 1.0
+                if now - last_activity < idle_timeout:
+                    remaining = idle_timeout - (now - last_activity)
+                    if remaining < 1.0:
+                        wait_timeout = remaining
+
+                if not board.button.wait_for_press(timeout=wait_timeout):
+                    continue
+
+                led_dimmed = False
+                last_activity = time.monotonic()
                 board.button.wait_for_release()
 
                 try:
                     run_voice_turn(cfg, history, board=board, leds=rgb_leds)
                 except Exception as e:
-                    set_led(board, _led_state("BLINK"), leds=rgb_leds)
+                    set_led(board, "ERROR", leds=rgb_leds)
                     print(f"Error: {e}")
                 finally:
-                    set_led(board, _led_state("OFF"), leds=rgb_leds)
+                    last_activity = time.monotonic()
+                    set_led(board, "READY", leds=rgb_leds)
+                    led_dimmed = False
 
                 if once:
                     return 0
     except KeyboardInterrupt:
-        print("\\nStopped.")
+        print("\nStopped.")
         return 0
     except Exception as e:
         print(f"AIY board error: {e}. Falling back to voice/text mode.")
         if has_capture_device() and has_playback_device():
             return run_voice_loop(cfg, once)
         return run_text_loop(cfg, once)
+
+
+
+def speak_text(text: str, cfg: Config) -> int:
+    if not text.strip():
+        return 0
+
+    if not has_playback_device():
+        print("No playback device detected. Cannot speak text.")
+        return 1
+
+    with tempfile.TemporaryDirectory(prefix="aiyvoice_") as tmp:
+        out_wav = Path(tmp) / "speech.wav"
+        synthesize_speech(text, out_wav, cfg)
+        play_wav(out_wav, cfg)
+    return 0
 
 
 def run_text_loop(cfg: Config, once: bool) -> int:
@@ -502,15 +712,19 @@ def run_text_loop(cfg: Config, once: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AIYVoice bot")
-    parser.add_argument("--mode", choices=["auto", "aiy", "voice", "text"], default="auto")
+    parser.add_argument("--mode", choices=["auto", "aiy", "voice", "text"], default="aiy")
     parser.add_argument("--once", action="store_true", help="Run one turn and exit")
     parser.add_argument("--self-test", action="store_true", help="Print local checks and exit")
+    parser.add_argument("--speak", type=str, help="Speak provided text and exit")
     args = parser.parse_args()
 
     cfg = build_config()
 
     if args.self_test:
         return print_self_test(cfg)
+
+    if args.speak is not None:
+        return speak_text(args.speak, cfg)
 
     if not cfg.api_key:
         print("OPENAI_API_KEY is missing. Put it in ~/.env or ./.env")
