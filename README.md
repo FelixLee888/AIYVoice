@@ -9,6 +9,9 @@ Local voice assistant bot for the AIYVoice Raspberry Pi.
 - Transcribes speech using OpenAI audio transcription
 - Generates assistant replies using OpenAI chat completions
 - Speaks replies using OpenAI TTS + `aplay`
+- Forwards messages to Telegram routes when trigger names are mentioned:
+  - `Fa Fa` / `花花` -> Chief Fafa target
+  - `Yuen Yuen` / `園園` -> Yuen Yuen target
 - Falls back to text mode if no microphone is detected
 
 ## Files
@@ -24,6 +27,10 @@ Local voice assistant bot for the AIYVoice Raspberry Pi.
    nano .env
    ```
 2. Set `OPENAI_API_KEY` in `.env` (or globally in shell profile).
+3. Optional Telegram routing:
+   - Set `TELEGRAM_BOT_TOKEN`.
+   - Set `TELEGRAM_CHIEF_FAFA_CHAT_ID` and/or `TELEGRAM_YUEN_YUEN_CHAT_ID`.
+   - Optional prefixes: `TELEGRAM_CHIEF_FAFA_PREFIX`, `TELEGRAM_YUEN_YUEN_PREFIX`.
 
 ## Run
 - Auto mode (prefers AIY mode if AIY library is available):

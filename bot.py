@@ -12,7 +12,7 @@ import urllib.request
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -57,6 +57,11 @@ class Config:
     system_prompt: str
     max_turns: int
     playback_volume: int
+    telegram_bot_token: str
+    chief_fafa_chat_id: str
+    chief_fafa_prefix: str
+    yuen_yuen_chat_id: str
+    yuen_yuen_prefix: str
 
 
 def env(name: str, default: str) -> str:
@@ -84,6 +89,11 @@ def build_config() -> Config:
         ),
         max_turns=int(env("MAX_TURNS", "6")),
         playback_volume=int(env("PLAYBACK_VOLUME", "80")),
+        telegram_bot_token=env("TELEGRAM_BOT_TOKEN", ""),
+        chief_fafa_chat_id=env("TELEGRAM_CHIEF_FAFA_CHAT_ID", ""),
+        chief_fafa_prefix=env("TELEGRAM_CHIEF_FAFA_PREFIX", ""),
+        yuen_yuen_chat_id=env("TELEGRAM_YUEN_YUEN_CHAT_ID", ""),
+        yuen_yuen_prefix=env("TELEGRAM_YUEN_YUEN_PREFIX", ""),
     )
 
 
@@ -486,6 +496,70 @@ def chat_reply(user_text: str, history: List[Dict[str, str]], cfg: Config) -> st
     return text.strip()
 
 
+def telegram_send_message(bot_token: str, chat_id: str, text: str, timeout: int = 20) -> None:
+    if not bot_token or not chat_id or not text.strip():
+        return
+
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        data=json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        details = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram HTTP {e.code}: {details}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Telegram network error: {e}") from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid Telegram JSON response: {raw[:500]}") from e
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram sendMessage failed: {data}")
+
+
+def _build_telegram_routes(message: str, cfg: Config) -> List[Tuple[str, str, str, str]]:
+    normalized = " ".join(message.casefold().split())
+    compact = normalized.replace(" ", "")
+    routes: List[Tuple[str, str, str, str]] = []
+
+    if "花花" in message or "fa fa" in normalized or "fafa" in compact:
+        routes.append(
+            ("Chief Fafa", "TELEGRAM_CHIEF_FAFA_CHAT_ID", cfg.chief_fafa_chat_id, cfg.chief_fafa_prefix)
+        )
+    if "園園" in message or "园园" in message or "yuen yuen" in normalized or "yuenyuen" in compact:
+        routes.append(
+            ("Yuen Yuen", "TELEGRAM_YUEN_YUEN_CHAT_ID", cfg.yuen_yuen_chat_id, cfg.yuen_yuen_prefix)
+        )
+    return routes
+
+
+def forward_mentions_to_telegram(message: str, cfg: Config) -> None:
+    if not message.strip() or not cfg.telegram_bot_token:
+        return
+
+    routes = _build_telegram_routes(message, cfg)
+    if not routes:
+        return
+
+    for route_name, env_name, chat_id, prefix in routes:
+        if not chat_id:
+            print(f"Warning: {route_name} mention detected but {env_name} is not configured.")
+            continue
+        outbound = f"{prefix}{message}" if prefix else message
+        try:
+            telegram_send_message(cfg.telegram_bot_token, chat_id, outbound)
+            print(f"Forwarded message to {route_name} on Telegram.")
+        except Exception as e:
+            print(f"Warning: failed to forward to {route_name} on Telegram ({e})")
+
+
 def synthesize_speech(text: str, path: Path, cfg: Config) -> None:
     if not text.strip():
         raise ValueError("No text provided for speech synthesis.")
@@ -546,6 +620,7 @@ def run_voice_turn(cfg: Config, history: List[Dict[str, str]], board=None, leds=
             set_led(board, "READY", leds=leds)
             return
         print(f"You: {user_text}")
+        forward_mentions_to_telegram(user_text, cfg)
 
         set_led(board, "THINKING", leds=leds)
         reply = chat_reply(user_text, history, cfg)
@@ -693,6 +768,7 @@ def run_text_loop(cfg: Config, once: bool) -> int:
             continue
 
         try:
+            forward_mentions_to_telegram(user_text, cfg)
             reply = chat_reply(user_text, history, cfg)
             print(textwrap.fill(f"AIYVoice: {reply}", width=92))
 
